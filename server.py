@@ -1,167 +1,329 @@
 #!/usr/bin/env python3
-import logging
-import json
+"""
+MCP Server для записи действий браузера
+Исправленная версия без ошибки NoneType
+"""
 import asyncio
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+from pathlib import Path
+
 from starlette.applications import Starlette
-from starlette.routing import Route, Mount
+from starlette.routing import Route
+from starlette.responses import JSONResponse, Response
+from starlette.requests import Request
+from sse_starlette.sse import EventSourceResponse
+
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp import types
+
 import uvicorn
-from mcp.server.models import InitializationOptions
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("server")
-
-# Fallback for NotificationOptions
-try:
-    from mcp.server import NotificationOptions
-except ImportError:
-    class NotificationOptions:
-        def __init__(self, *args, **kwargs): pass
-
-server = Server("playwright-tools")
-sse = SseServerTransport("/messages")
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Глобальное состояние
-state = {
-    "playwright": None, "browser": None, "context": None, "active_page": None
-}
-timeline = []
+class AppState:
+    def __init__(self):
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        self.playwright = None
+        self.recording = False
+        self.timeline: List[Dict] = []
+        self.sessions: Dict[str, Dict] = {}
 
-# JS Скрипт (внедряется во все вкладки)
-RECORDER_JS = """
-(() => {
-    if (window._mcpRecorderActive) return;
-    window._mcpRecorderActive = true;
-    console.log("🔴 [MCP] Recorder injected");
+app_state = AppState()
 
-    function getSelector(el) {
-        try {
-            if (el.getAttribute('data-testid')) return `[data-testid="${el.getAttribute('data-testid')}"]`;
-            if (el.id) return '#' + el.id;
-            if (el.tagName === 'A' && el.innerText) return `text=${el.innerText.trim()}`;
-            if (el.tagName === 'BUTTON' && el.innerText) return `button:has-text("${el.innerText.trim()}")`;
-            if (el.getAttribute('aria-label')) return `[aria-label="${el.getAttribute('aria-label')}"]`;
-            return el.tagName.toLowerCase();
-        } catch { return "unknown"; }
-    }
+# MCP Server
+mcp_server = Server("browser-recorder")
 
-    async function record(type, target, extra={}) {
-        if (!window.mcp_record_event) return;
-        const sel = getSelector(target);
-        await window.mcp_record_event(JSON.stringify({
-            type: type, selector: sel, url: window.location.href, ...extra
-        }));
-    }
-
-    document.addEventListener('click', (e) => record('click', e.target, {text: e.target.innerText?.substring(0,50)}), true);
-    document.addEventListener('change', (e) => record('fill', e.target, {value: e.target.value}), true);
-    document.addEventListener('keydown', (e) => { if(e.key === 'Enter') record('press', e.target, {key: 'Enter'}); }, true);
-})();
-"""
-
-async def init_browser():
-    from playwright.async_api import async_playwright
-    if not state["playwright"]:
-        state["playwright"] = await async_playwright().start()
-    if not state["browser"]:
-        state["browser"] = await state["playwright"].chromium.launch(headless=False, slow_mo=100, args=["--start-maximized"])
-    
-    if not state["context"]:
-        state["context"] = await state["browser"].new_context(viewport={"width": 1600, "height": 900})
-
-        # Binding для событий
-        async def handle_event(source, raw_json):
-            try:
-                # Пытаемся достать страницу из source
-                page = source.page if hasattr(source, "page") else (source.get("page") if isinstance(source, dict) else state["active_page"])
-                if page: state["active_page"] = page
-                
-                event = json.loads(raw_json)
-                logger.info(f"📸 {event['type']} on {event.get('selector')}")
-                
-                await asyncio.sleep(0.5) # Ждем реакции UI
-                
-                try: snapshot = await page.accessibility.snapshot()
-                except: snapshot = {"error": "failed"}
-                
-                timeline.append({
-                    "step": len(timeline)+1, "action": event,
-                    "page_url": page.url, "accessibility_tree": snapshot
-                })
-            except Exception as e:
-                logger.error(f"Event Error: {e}")
-
-        await state["context"].expose_binding("mcp_record_event", handle_event)
-        await state["context"].add_init_script(RECORDER_JS)
-        
-        # Обработка новых вкладок
-        state["context"].on("page", lambda p: timeline.append({
-            "step": len(timeline)+1, "action": {"type": "new_window_opened"}, 
-            "is_popup": True, "page_url": "new_window"
-        }))
-        
-        state["active_page"] = await state["context"].new_page()
-        
-    return state["active_page"]
-
-@server.list_tools()
-async def list_tools() -> list[Tool]:
+@mcp_server.list_tools()
+async def list_tools() -> list[types.Tool]:
+    """Список доступных инструментов"""
     return [
-        Tool(name="navigate", description="Go to URL", inputSchema={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}),
-        Tool(name="start_recording", description="Inject JS", inputSchema={"type": "object", "properties": {}}),
-        Tool(name="get_timeline", description="Get logs", inputSchema={"type": "object", "properties": {}}),
-        # Инструменты для Агента (AI)
-        Tool(name="click", description="Click selector", inputSchema={"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}),
-        Tool(name="fill", description="Type text", inputSchema={"type": "object", "properties": {"selector": {"type": "string"}, "text": {"type": "string"}}, "required": ["selector", "text"]}),
-        Tool(name="read_page", description="Get text", inputSchema={"type": "object", "properties": {}}),
+        types.Tool(
+            name="navigate",
+            description="Переход на URL",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL для навигации"}
+                },
+                "required": ["url"]
+            }
+        ),
+        types.Tool(
+            name="click",
+            description="Клик по элементу",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS селектор"}
+                },
+                "required": ["selector"]
+            }
+        ),
+        types.Tool(
+            name="fill",
+            description="Заполнить поле",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "text": {"type": "string"}
+                },
+                "required": ["selector", "text"]
+            }
+        ),
+        types.Tool(
+            name="start_recording",
+            description="Начать запись действий",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        types.Tool(
+            name="stop_recording",
+            description="Остановить запись",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        types.Tool(
+            name="get_timeline",
+            description="Получить записанные действия",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        types.Tool(
+            name="read_page",
+            description="Прочитать содержимое страницы",
+            inputSchema={"type": "object", "properties": {}}
+        )
     ]
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    page = await init_browser()
-    
+@mcp_server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    """Обработка вызовов инструментов"""
     try:
+        logger.info(f"Tool called: {name} with args: {arguments}")
+
+        # Инициализация браузера если нужно
+        if not app_state.page and name != "stop_recording":
+            await init_browser()
+
+        # Обработка команд
         if name == "navigate":
-            await page.goto(arguments["url"])
-            return [TextContent(type="text", text="Navigated")]
-        
-        elif name == "start_recording":
-            await page.evaluate(RECORDER_JS)
-            return [TextContent(type="text", text="Recording Active")]
-            
-        elif name == "get_timeline":
-            return [TextContent(type="text", text=json.dumps(timeline, ensure_ascii=False))]
-            
-        # Инструменты для агента
+            url = arguments["url"]
+            await app_state.page.goto(url, wait_until="domcontentloaded")
+
+            if app_state.recording:
+                app_state.timeline.append({
+                    "action": "navigate",
+                    "url": url,
+                    "timestamp": datetime.now().isoformat(),
+                    "page_url": app_state.page.url
+                })
+
+            return [types.TextContent(
+                type="text",
+                text=f"Navigated to {url}"
+            )]
+
         elif name == "click":
-            sel = arguments["selector"]
-            if "text=" in sel: await page.click(sel) # Playwright native text locator
-            else: await page.click(sel)
-            return [TextContent(type="text", text=f"Clicked {sel}")]
-            
+            selector = arguments["selector"]
+            await app_state.page.click(selector, timeout=5000)
+
+            if app_state.recording:
+                app_state.timeline.append({
+                    "action": "click",
+                    "selector": selector,
+                    "timestamp": datetime.now().isoformat(),
+                    "page_url": app_state.page.url
+                })
+
+            return [types.TextContent(
+                type="text",
+                text=f"Clicked on {selector}"
+            )]
+
         elif name == "fill":
-            await page.fill(arguments["selector"], arguments["text"])
-            return [TextContent(type="text", text="Filled")]
-            
+            selector = arguments["selector"]
+            text = arguments["text"]
+            await app_state.page.fill(selector, text, timeout=5000)
+
+            if app_state.recording:
+                app_state.timeline.append({
+                    "action": "fill",
+                    "selector": selector,
+                    "text": text,
+                    "timestamp": datetime.now().isoformat(),
+                    "page_url": app_state.page.url
+                })
+
+            return [types.TextContent(
+                type="text",
+                text=f"Filled {selector} with text"
+            )]
+
+        elif name == "start_recording":
+            app_state.recording = True
+            app_state.timeline = []
+            logger.info("Recording started")
+
+            return [types.TextContent(
+                type="text",
+                text="Recording started"
+            )]
+
+        elif name == "stop_recording":
+            app_state.recording = False
+            logger.info(f"Recording stopped. Total steps: {len(app_state.timeline)}")
+
+            return [types.TextContent(
+                type="text",
+                text=f"Recording stopped. Steps: {len(app_state.timeline)}"
+            )]
+
+        elif name == "get_timeline":
+            import json
+            timeline_json = json.dumps(app_state.timeline, ensure_ascii=False)
+
+            return [types.TextContent(
+                type="text",
+                text=timeline_json
+            )]
+
         elif name == "read_page":
-            text = await page.inner_text("body")
-            return [TextContent(type="text", text=text[:5000])]
+            content = await app_state.page.content()
+            # Ограничиваем размер
+            if len(content) > 50000:
+                content = content[:50000] + "\n... [truncated]"
+
+            return [types.TextContent(
+                type="text",
+                text=content
+            )]
+
+        else:
+            raise ValueError(f"Unknown tool: {name}")
 
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {e}")]
-    
-    return []
+        logger.error(f"Error in tool {name}: {e}", exc_info=True)
+        return [types.TextContent(
+            type="text",
+            text=f"Error: {str(e)}"
+        )]
 
-async def handle_sse(request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await server.run(streams[0], streams[1], server.create_initialization_options())
+async def init_browser():
+    """Инициализация браузера"""
+    if app_state.browser:
+        return
 
-async def messages_asgi(scope, receive, send):
-    await sse.handle_post_message(scope, receive, send)
+    logger.info("Initializing browser...")
+    app_state.playwright = await async_playwright().start()
+    app_state.browser = await app_state.playwright.chromium.launch(
+        headless=False,
+        slow_mo=50
+    )
+    app_state.context = await app_state.browser.new_context(
+        viewport={"width": 1920, "height": 1080}
+    )
+    app_state.page = await app_state.context.new_page()
+    logger.info("Browser initialized")
 
-app = Starlette(routes=[Route("/sse", endpoint=handle_sse), Mount("/messages", app=messages_asgi)])
+# Starlette приложение
+# Создаем транспорт один раз
+sse = SseServerTransport("/messages")
+
+async def handle_sse(scope, receive, send):
+    """SSE эндпоинт - ИСПРАВЛЕНО"""
+    try:
+        # ✅ Используем connect_sse() который является async context manager
+        async with sse.connect_sse(scope, receive, send) as streams:
+            read_stream, write_stream = streams
+            
+            await mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp_server.create_initialization_options()
+            )
+    except Exception as e:
+        logger.error(f"SSE error: {e}", exc_info=True)
+        raise
+async def handle_messages(scope, receive, send):
+    """POST сообщения - ИСПРАВЛЕНО"""
+    try:
+        # ✅ Используем handle_post_message транспорта
+        await sse.handle_post_message(scope, receive, send)
+    except Exception as e:
+        logger.error(f"Messages error: {e}", exc_info=True)
+        response = JSONResponse({"error": str(e)}, status_code=500)
+        await response(scope, receive, send)
+
+
+async def health_check(request: Request) -> Response:
+    """Health check эндпоинт"""
+    return JSONResponse({
+        "status": "healthy",
+        "browser_ready": app_state.browser is not None,
+        "recording": app_state.recording,
+        "timeline_steps": len(app_state.timeline)
+    })
+
+# Маршруты
+routes = [
+    Route("/sse", handle_sse, methods=["GET"]),
+    Route("/messages", handle_messages, methods=["POST"]),
+    Route("/messages/", handle_messages, methods=["POST"]),  # С trailing slash
+    Route("/health", health_check, methods=["GET"]),
+]
+
+# Создание Starlette app
+starlette_app = Starlette(
+    debug=True,
+    routes=routes
+)
+
+# Lifecycle события
+@starlette_app.on_event("startup")
+async def startup():
+    """Запуск сервера"""
+    logger.info("MCP Server starting...")
+    Path("logs").mkdir(exist_ok=True)
+    Path("recorded_tests").mkdir(exist_ok=True)
+
+@starlette_app.on_event("shutdown")
+async def shutdown():
+    """Остановка сервера"""
+    logger.info("MCP Server shutting down...")
+
+    if app_state.page:
+        await app_state.page.close()
+    if app_state.context:
+        await app_state.context.close()
+    if app_state.browser:
+        await app_state.browser.close()
+    if app_state.playwright:
+        await app_state.playwright.stop()
+
+def main():
+    """Запуск сервера"""
+    import os
+    host = os.getenv("SERVER_HOST", "0.0.0.0")
+    port = int(os.getenv("SERVER_PORT", 8000))
+
+    logger.info(f"Starting MCP Server on {host}:{port}")
+
+    uvicorn.run(
+        starlette_app,
+        host=host,
+        port=port,
+        log_level="info"
+    )
 
 if __name__ == "__main__":
-    uvicorn.run(app, port=8000)
+    main()

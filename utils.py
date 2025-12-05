@@ -1,44 +1,36 @@
+"""Утилиты для MCP клиента"""
 import os
-import httpx
 from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
-# --- КОНФИГУРАЦИЯ ---
-API_KEY = os.getenv("OPENAI_API_KEY", "sk-aitunnel-oYUy5dzTcsFEM8ippJCtlQ8WaEYWmHL9")
-BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.aitunnel.ru/v1")
-MODEL_NAME = "gpt-5-nano"
-SERVER_URL = "http://localhost:8000/sse"
+load_dotenv()
 
-def get_llm_client():
-    http_client = httpx.AsyncClient()
-    return AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, http_client=http_client)
+# Конфигурация
+API_KEY = os.getenv("API_KEY", "your-api-key")
+BASE_URL = os.getenv("BASE_URL", "https://api.aitunnel.ru/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4")
+SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8000/sse")
 
-# --- ПРОМПТЫ ---
-SYSTEM_PROMPT_AGENT = """
-Ты — эксперт по автоматизации (QA Automation Engineer).
-Твоя цель — выполнить задачу пользователя, используя инструменты браузера.
-1. Сначала перейди на сайт (`navigate`).
-2. Если нужно найти элемент, используй селекторы по тексту (`text=...`) или атрибутам.
-3. Если открывается новое окно — учитывай это.
-"""
-
+# Промпт для генерации тестов
 PROMPT_GENERATE_TEST = """
-Ты — Senior SDET. Напиши валидный тест Playwright на Python (async).
+Ты — Senior SDET эксперт по Playwright.
+На основе записанных действий пользователя создай полный автотест на Python + Playwright.
 
-ВХОДНЫЕ ДАННЫЕ (История действий):
+Записанные действия (JSON):
 {json_str}
 
-ТРЕБОВАНИЯ:
-1. Используй ТОЛЬКО асинхронный API: `async with async_playwright() as p`.
-2. `browser = await p.chromium.launch(headless=False, slow_mo=1000)`.
-3. Если действие `click`, используй `await page.click("...")`.
-4. Обработка POPUP/Вкладок:
-   Если в логе есть `new_window_opened` или `is_popup: true` ПОСЛЕ клика:
-async with page.expect_popup() as popup_info:
-await page.click("селектор")
-page1 = await popup_info.value
-await page1.wait_for_load_state()
+Требования к коду:
+1. Используй async/await
+2. Добавь явные ожидания элементов
+3. Используй надежные селекторы (data-*, id, formcontrolname)
+4. Добавь логирование действий
+5. Обработай ошибки
+6. Добавь скриншоты при падении
+7. Используй Page Object паттерн если нужно
 
-text
-Далее работай с `page1`.
-5. Верни ТОЛЬКО код, без markdown.
+Верни ТОЛЬКО Python код без пояснений.
 """
+
+def get_llm_client():
+    """Получить клиент OpenAI"""
+    return AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
